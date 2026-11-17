@@ -18,17 +18,21 @@ ENV:
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 import html
+import hmac
 import json
 import os
 import time
+import re
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qs
 
 import psycopg2
 import psycopg2.extras
+from psycopg2.pool import ThreadedConnectionPool
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 APP_ID = os.environ.get("APP_ID", "forja-viral").strip()
@@ -39,6 +43,8 @@ DEBUG_ERRORS = (os.environ.get("DEBUG_ERRORS", "0").strip() == "1")
 
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL env var missing (postgres connection string).")
+if len(ADMIN_TOKEN) < 32:
+    raise RuntimeError("ADMIN_TOKEN must be configured with at least 32 characters.")
 
 
 def _now() -> int:
@@ -76,8 +82,26 @@ def _sign_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+_DB_POOL_MAX = max(2, min(int(os.environ.get("DB_POOL_MAX", "10")), 30))
+_DB_POOL = ThreadedConnectionPool(
+    1,
+    _DB_POOL_MAX,
+    DATABASE_URL,
+    cursor_factory=psycopg2.extras.RealDictCursor,
+    connect_timeout=5,
+    options="-c statement_timeout=8000 -c lock_timeout=5000",
+    application_name="forja-license-api",
+)
+
+
+@contextmanager
 def _db():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    con = _DB_POOL.getconn()
+    try:
+        with con:
+            yield con
+    finally:
+        _DB_POOL.putconn(con, close=bool(con.closed))
 
 
 def _migrate() -> None:
@@ -99,6 +123,14 @@ def _migrate() -> None:
         "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS plan TEXT;",
         "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS hwid TEXT;",
         "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;",
+        "DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='licenses_credits_nonnegative') THEN ALTER TABLE licenses ADD CONSTRAINT licenses_credits_nonnegative CHECK (credits >= 0) NOT VALID; END IF; END $$;",
+        "CREATE TABLE IF NOT EXISTS license_creation_operations (operation_id TEXT PRIMARY KEY, license_key TEXT UNIQUE NOT NULL, credits INT NOT NULL CHECK (credits >= 0), days INT NOT NULL CHECK (days > 0), plan TEXT NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP);",
+        "CREATE TABLE IF NOT EXISTS credit_operations (operation_id TEXT PRIMARY KEY, license_key TEXT NOT NULL, amount INT NOT NULL CHECK (amount > 0), credits_after INT NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP);",
+        "CREATE INDEX IF NOT EXISTS credit_operations_license_idx ON credit_operations (license_key, created_at);",
+        "CREATE TABLE IF NOT EXISTS consumption_operations (operation_id TEXT PRIMARY KEY, license_key TEXT NOT NULL, amount INT NOT NULL CHECK (amount > 0), refunded INT NOT NULL DEFAULT 0 CHECK (refunded >= 0), credits_after INT NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP);",
+        "ALTER TABLE consumption_operations ADD COLUMN IF NOT EXISTS refunded INT NOT NULL DEFAULT 0 CHECK (refunded >= 0);",
+        "CREATE INDEX IF NOT EXISTS consumption_operations_license_idx ON consumption_operations (license_key, created_at);",
+        "CREATE TABLE IF NOT EXISTS refund_operations (refund_operation_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL, license_key TEXT NOT NULL, amount INT NOT NULL CHECK (amount > 0), credits_after INT NOT NULL, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP);",
     ]
     with _db() as con:
         with con.cursor() as cur:
@@ -111,10 +143,8 @@ _migrate()
 
 
 def _require_admin(req: Request) -> str:
-    if not ADMIN_TOKEN:
-        raise HTTPException(500, "ADMIN_TOKEN not set")
-    tok = req.query_params.get("token") or req.headers.get("x-admin-token") or ""
-    if tok != ADMIN_TOKEN:
+    tok = req.headers.get("x-admin-token") or ""
+    if not hmac.compare_digest(tok, ADMIN_TOKEN):
         raise HTTPException(401, "unauthorized")
     return tok
 
@@ -156,29 +186,34 @@ def _validate_row(row: Dict[str, Any], hwid: str) -> Optional[str]:
         return "blocked"
     if int(row["exp"]) <= _now():
         return "expired"
-    if row.get("hwid") and row["hwid"] != hwid:
-        return "hwid_mismatch"
+    # HWID nao e mais verificado: a chave funciona em qualquer computador.
     return None
 
 
 app = FastAPI(title="Forja Viral License Server (PG + Credits) — SSR Admin v2")
 
 
+@app.on_event("shutdown")
+def _close_db_pool() -> None:
+    _DB_POOL.closeall()
+
+
 @app.get("/health")
-async def health() -> JSONResponse:
-    return JSONResponse({"ok": True, "app": APP_ID, "ts": _now()})
+def health() -> JSONResponse:
+    try:
+        with _db() as con:
+            with con.cursor() as cur:
+                cur.execute("SELECT 1")
+        return JSONResponse({"ok": True, "app": APP_ID, "ts": _now()})
+    except Exception:
+        return JSONResponse({"ok": False, "app": APP_ID, "reason": "database_unavailable"}, status_code=503)
 
 
 @app.post("/check")
-async def check(req: Request) -> JSONResponse:
-    try:
-        data = await req.json()
-    except Exception:
-        return _reason("bad_request")
-
+def check(data: Dict[str, Any]) -> JSONResponse:
     license_key = str((data or {}).get("license_key") or "").strip()
     hwid = str((data or {}).get("hwid") or "").strip()
-    if not license_key or not hwid:
+    if not license_key:
         return _reason("missing_fields")
 
     try:
@@ -192,12 +227,7 @@ async def check(req: Request) -> JSONResponse:
                 if reason:
                     return _reason(reason)
 
-                if not row.get("hwid"):
-                    cur.execute(
-                        "UPDATE licenses SET hwid=%s, updated_at=NOW() WHERE license_key=%s",
-                        (hwid, license_key),
-                    )
-                    row["hwid"] = hwid
+                # HWID nao e mais gravado na licenca.
 
         return _issue_token(row, hwid)
     except Exception as e:
@@ -206,22 +236,28 @@ async def check(req: Request) -> JSONResponse:
 
 
 @app.post("/activate")
-async def activate(req: Request) -> JSONResponse:
-    return await check(req)
+def activate(data: Dict[str, Any]) -> JSONResponse:
+    return check(data)
+
+
+@app.post("/api/license/check")
+def api_license_check(data: Dict[str, Any]) -> JSONResponse:
+    return check(data)
 
 
 @app.post("/consume_n")
-async def consume_n(req: Request) -> JSONResponse:
-    try:
-        data = await req.json()
-    except Exception:
-        return _reason("bad_request")
-
+def consume_n(data: Dict[str, Any], idempotency_key: Optional[str] = Header(default=None)) -> JSONResponse:
     license_key = str((data or {}).get("license_key") or "").strip()
     hwid = str((data or {}).get("hwid") or "").strip()
-    n = int((data or {}).get("n") or 0)
-    if not license_key or not hwid or n <= 0:
+    operation_id = str((data or {}).get("operation_id") or idempotency_key or "").strip()
+    try:
+        n = int((data or {}).get("n") or 0)
+    except (TypeError, ValueError):
+        return _reason("bad_request")
+    if not license_key or not operation_id or n <= 0 or n > 5000:
         return _reason("missing_fields")
+    if len(operation_id) > 128 or not re.fullmatch(r"[A-Za-z0-9._:-]+", operation_id):
+        return _reason("bad_request")
 
     try:
         with _db() as con:
@@ -234,12 +270,17 @@ async def consume_n(req: Request) -> JSONResponse:
                 if reason:
                     return _reason(reason)
 
-                if not row.get("hwid"):
-                    cur.execute(
-                        "UPDATE licenses SET hwid=%s, updated_at=NOW() WHERE license_key=%s",
-                        (hwid, license_key),
-                    )
-                    row["hwid"] = hwid
+                cur.execute(
+                    "SELECT license_key, amount FROM consumption_operations WHERE operation_id=%s",
+                    (operation_id,),
+                )
+                previous = cur.fetchone()
+                if previous:
+                    if previous["license_key"] != license_key or int(previous["amount"]) != n:
+                        return _reason("idempotency_conflict")
+                    return _issue_token(row, hwid)
+
+                # HWID nao e mais gravado na licenca.
 
                 credits = int(row.get("credits") or 0)
                 if credits < n:
@@ -255,6 +296,10 @@ async def consume_n(req: Request) -> JSONResponse:
                 row["exp"] = int(upd["exp"])
                 row["plan"] = upd.get("plan") or ""
                 row["status"] = upd.get("status") or "active"
+                cur.execute(
+                    "INSERT INTO consumption_operations (operation_id, license_key, amount, credits_after) VALUES (%s,%s,%s,%s)",
+                    (operation_id, license_key, n, row["credits"]),
+                )
 
         return _issue_token(row, hwid)
     except Exception as e:
@@ -262,22 +307,94 @@ async def consume_n(req: Request) -> JSONResponse:
         return _reason("server_error", detail=str(e))
 
 
-@app.post("/consume")
-async def consume(req: Request) -> JSONResponse:
-    # debit exactly 1 (safe fallback)
-    try:
-        data = await req.json()
-    except Exception:
-        return _reason("bad_request")
+@app.post("/refund_n")
+def refund_n(data: Dict[str, Any], idempotency_key: Optional[str] = Header(default=None)) -> JSONResponse:
     license_key = str((data or {}).get("license_key") or "").strip()
     hwid = str((data or {}).get("hwid") or "").strip()
-    if not license_key or not hwid:
+    operation_id = str((data or {}).get("operation_id") or "").strip()
+    refund_operation_id = str((data or {}).get("refund_operation_id") or idempotency_key or "").strip()
+    try:
+        n = int((data or {}).get("n") or 0)
+    except (TypeError, ValueError):
+        return _reason("bad_request")
+    if not license_key or not operation_id or not refund_operation_id or n <= 0 or n > 5000:
+        return _reason("missing_fields")
+    if any(len(value) > 128 or not re.fullmatch(r"[A-Za-z0-9._:-]+", value) for value in (operation_id, refund_operation_id)):
+        return _reason("bad_request")
+
+    try:
+        with _db() as con:
+            with con.cursor() as cur:
+                row = _load_row_for_update(cur, license_key)
+                if not row:
+                    return _reason("not_found")
+                # A refund is settlement of an already accepted debit; it remains valid
+                # if the license expires or is blocked while local rendering is running.
+                # HWID nao e mais verificado no estorno.
+
+                cur.execute(
+                    "SELECT operation_id, license_key, amount, refunded FROM consumption_operations WHERE operation_id=%s FOR UPDATE",
+                    (operation_id,),
+                )
+                debit = cur.fetchone()
+                if not debit or debit["license_key"] != license_key:
+                    return _reason("debit_not_found")
+
+                cur.execute(
+                    "SELECT operation_id, license_key, amount FROM refund_operations WHERE refund_operation_id=%s",
+                    (refund_operation_id,),
+                )
+                prior_refund = cur.fetchone()
+                if prior_refund:
+                    if (prior_refund["operation_id"] != operation_id or
+                            prior_refund["license_key"] != license_key or int(prior_refund["amount"]) != n):
+                        return _reason("idempotency_conflict")
+                    return _issue_token(row, hwid)
+
+                if int(debit["refunded"]) + n > int(debit["amount"]):
+                    return _reason("refund_exceeds_debit")
+
+                cur.execute(
+                    "UPDATE licenses SET credits=credits+%s, updated_at=NOW() WHERE license_key=%s RETURNING credits",
+                    (n, license_key),
+                )
+                row["credits"] = int(cur.fetchone()["credits"])
+                cur.execute(
+                    "UPDATE consumption_operations SET refunded=refunded+%s WHERE operation_id=%s",
+                    (n, operation_id),
+                )
+                cur.execute(
+                    "INSERT INTO refund_operations (refund_operation_id, operation_id, license_key, amount, credits_after) VALUES (%s,%s,%s,%s,%s)",
+                    (refund_operation_id, operation_id, license_key, n, row["credits"]),
+                )
+        return _issue_token(row, hwid)
+    except Exception as e:
+        print("[/refund_n] error:", repr(e))
+        return _reason("server_error", detail=str(e))
+
+
+@app.post("/consume")
+def consume(data: Dict[str, Any], idempotency_key: Optional[str] = Header(default=None)) -> JSONResponse:
+    # debit exactly 1 (safe fallback)
+    license_key = str((data or {}).get("license_key") or "").strip()
+    hwid = str((data or {}).get("hwid") or "").strip()
+    if not license_key:
         return _reason("missing_fields")
     # route to consume_n by creating a new local dict
-    class _FakeReq:
-        async def json(self):
-            return {"license_key": license_key, "hwid": hwid, "n": 1}
-    return await consume_n(_FakeReq())  # type: ignore
+    operation_id = idempotency_key or str((data or {}).get("operation_id") or "")
+    if not operation_id:
+        return _reason("missing_idempotency_key")
+    return consume_n({"license_key": license_key, "hwid": hwid, "n": 1, "operation_id": operation_id}, operation_id)
+
+
+@app.post("/api/license/consume")
+def api_license_consume(data: Dict[str, Any], idempotency_key: Optional[str] = Header(default=None)) -> JSONResponse:
+    return consume_n(data, idempotency_key)
+
+
+@app.post("/api/license/refund")
+def api_license_refund(data: Dict[str, Any], idempotency_key: Optional[str] = Header(default=None)) -> JSONResponse:
+    return refund_n(data, idempotency_key)
 
 
 # ----------------------------
@@ -484,15 +601,163 @@ async def admin(req: Request) -> HTMLResponse:
     return HTMLResponse(_admin_page_html(tok, q, limit, items, meta))
 
 
+@app.get("/admin/api/licenses")
+async def admin_api_licenses(req: Request) -> JSONResponse:
+    tok = _require_admin(req)
+    q = (req.query_params.get("q") or "").strip().lower()
+    limit = int(req.query_params.get("limit") or 1000)
+
+    with _db() as con:
+        with con.cursor() as cur:
+            if q:
+                cur.execute(
+                    "SELECT license_key, hwid, exp, credits, plan, status, created_at, updated_at FROM licenses "
+                    "WHERE lower(license_key) LIKE %s OR lower(coalesce(hwid,'')) LIKE %s "
+                    "ORDER BY created_at DESC LIMIT %s",
+                    (f"%{q}%", f"%{q}%", limit),
+                )
+            else:
+                cur.execute(
+                    "SELECT license_key, hwid, exp, credits, plan, status, created_at, updated_at FROM licenses "
+                    "ORDER BY created_at DESC LIMIT %s",
+                    (limit,),
+                )
+            rows = [dict(x) for x in (cur.fetchall() or [])]
+            for r in rows:
+                if r.get("created_at"):
+                    r["created_at"] = str(r["created_at"])
+                if r.get("updated_at"):
+                    r["updated_at"] = str(r["updated_at"])
+
+    return JSONResponse({"ok": True, "licenses": rows})
+
+
+@app.post("/admin/api/credits/add")
+def admin_add_credits(data: Dict[str, Any], req: Request) -> JSONResponse:
+    _require_admin(req)
+    try:
+        form = data
+        license_key = str(form.get("license_key") or "").strip()
+        operation_id = str(form.get("operation_id") or req.headers.get("Idempotency-Key") or "").strip()
+        amount = int(form.get("add") or 0)
+    except (TypeError, ValueError):
+        return JSONResponse({"ok": False, "reason": "bad_request"}, status_code=400)
+
+    if not license_key or not operation_id or amount <= 0 or amount > 5000:
+        return JSONResponse({"ok": False, "reason": "invalid_fields"}, status_code=400)
+    if len(operation_id) > 128 or not re.fullmatch(r"[A-Za-z0-9._:-]+", operation_id):
+        return JSONResponse({"ok": False, "reason": "bad_operation_id"}, status_code=400)
+
+    try:
+        with _db() as con:
+            with con.cursor() as cur:
+                cur.execute(
+                    "SELECT license_key, amount, credits_after FROM credit_operations WHERE operation_id=%s",
+                    (operation_id,),
+                )
+                previous = cur.fetchone()
+                if previous:
+                    if previous["license_key"] != license_key or int(previous["amount"]) != amount:
+                        return JSONResponse({"ok": False, "reason": "idempotency_conflict"}, status_code=409)
+                    return JSONResponse({
+                        "ok": True,
+                        "duplicate": True,
+                        "credits": int(previous["credits_after"]),
+                    })
+
+                cur.execute(
+                    "SELECT license_key FROM licenses WHERE license_key=%s FOR UPDATE",
+                    (license_key,),
+                )
+                if not cur.fetchone():
+                    return JSONResponse({"ok": False, "reason": "not_found"}, status_code=404)
+
+                cur.execute(
+                    "UPDATE licenses SET credits=credits+%s, updated_at=NOW() WHERE license_key=%s RETURNING credits",
+                    (amount, license_key),
+                )
+                updated = cur.fetchone()
+                credits_after = int(updated["credits"])
+                cur.execute(
+                    "INSERT INTO credit_operations (operation_id, license_key, amount, credits_after) VALUES (%s,%s,%s,%s)",
+                    (operation_id, license_key, amount, credits_after),
+                )
+        return JSONResponse({"ok": True, "duplicate": False, "credits": credits_after})
+    except Exception as e:
+        print("[/admin/api/credits/add] error:", repr(e))
+        return JSONResponse({"ok": False, "reason": "server_error"}, status_code=500)
+
+
+@app.post("/admin/api/licenses/create")
+def admin_create_license(data: Dict[str, Any], req: Request) -> JSONResponse:
+    _require_admin(req)
+    try:
+        operation_id = str(data.get("operation_id") or "").strip()
+        license_key = str(data.get("license_key") or "").strip().upper()
+        credits = int(data.get("credits") or 0)
+        days = int(data.get("days") or 0)
+        plan = str(data.get("plan") or "custom").strip() or "custom"
+    except (TypeError, ValueError):
+        return JSONResponse({"ok": False, "reason": "bad_request"}, status_code=400)
+
+    if (not operation_id or len(operation_id) > 128 or
+            not re.fullmatch(r"[A-Za-z0-9._:-]+", operation_id) or
+            not license_key or len(license_key) > 80 or credits < 0 or credits > 1_000_000 or
+            days <= 0 or days > 3650):
+        return JSONResponse({"ok": False, "reason": "invalid_fields"}, status_code=400)
+
+    try:
+        with _db() as con:
+            with con.cursor() as cur:
+                cur.execute(
+                    "SELECT operation_id, license_key, credits, days, plan FROM license_creation_operations WHERE operation_id=%s",
+                    (operation_id,),
+                )
+                previous = cur.fetchone()
+                if previous:
+                    same_request = (
+                        previous["license_key"] == license_key and
+                        int(previous["credits"]) == credits and
+                        int(previous["days"]) == days and
+                        previous["plan"] == plan
+                    )
+                    if not same_request:
+                        return JSONResponse({"ok": False, "reason": "idempotency_conflict"}, status_code=409)
+                    return JSONResponse({"ok": True, "duplicate": True, "license_key": license_key})
+
+                cur.execute("SELECT 1 FROM licenses WHERE license_key=%s FOR UPDATE", (license_key,))
+                if cur.fetchone():
+                    return JSONResponse({"ok": False, "reason": "license_key_exists"}, status_code=409)
+
+                exp = _now() + days * 86400
+                cur.execute(
+                    "INSERT INTO licenses (license_key, exp, credits, plan, status) VALUES (%s,%s,%s,%s,'active')",
+                    (license_key, exp, credits, plan),
+                )
+                # Remove registros de operacao orfaos de uma chave que foi apagada
+                # anteriormente; sem isso o UNIQUE(license_key) impede recria-la.
+                cur.execute("DELETE FROM license_creation_operations WHERE license_key=%s", (license_key,))
+                cur.execute(
+                    "INSERT INTO license_creation_operations (operation_id, license_key, credits, days, plan) VALUES (%s,%s,%s,%s,%s)",
+                    (operation_id, license_key, credits, days, plan),
+                )
+        return JSONResponse({"ok": True, "duplicate": False, "license_key": license_key})
+    except Exception as e:
+        print("[/admin/api/licenses/create] error:", repr(e))
+        return JSONResponse({"ok": False, "reason": "server_error"}, status_code=500)
+
+
 @app.post("/admin/action")
-async def admin_action(req: Request) -> RedirectResponse:
+async def admin_action(req: Request):
     tok = _require_admin(req)
     body = await req.body()
     form = _parse_form_bytes(body)
     action = str(form.get("action") or "").strip()
 
-    def _redir() -> RedirectResponse:
-        return RedirectResponse(url=f"/admin?token={tok}", status_code=303)
+    def _redir(success: bool = False):
+        if "application/json" in req.headers.get("accept", "") or req.headers.get("x-admin-token"):
+            return JSONResponse({"ok": success}, status_code=200 if success else 400)
+        return RedirectResponse(url="/admin", status_code=303)
 
     try:
         with _db() as con:
@@ -507,7 +772,8 @@ async def admin_action(req: Request) -> RedirectResponse:
                         return _redir()
                     cur.execute("SELECT 1 FROM licenses WHERE license_key=%s", (lk,))
                     if cur.fetchone():
-                        return _redir()
+                        # Idempotent create retry: never fail a retried fulfillment silently.
+                        return _redir(True)
                     cur.execute(
                         "INSERT INTO licenses (license_key, exp, credits, plan, status) VALUES (%s,%s,%s,%s,'active')",
                         (lk, exp, credits, plan),
@@ -516,7 +782,7 @@ async def admin_action(req: Request) -> RedirectResponse:
                 elif action == "add_credits":
                     lk = str(form.get("license_key") or "").strip()
                     add = int(form.get("add") or 0)
-                    if not lk or add == 0:
+                    if not lk or add <= 0:
                         return _redir()
                     cur.execute(
                         "UPDATE licenses SET credits=credits+%s, updated_at=NOW() WHERE license_key=%s",
@@ -563,7 +829,7 @@ async def admin_action(req: Request) -> RedirectResponse:
                         return _redir()
                     cur.execute("DELETE FROM licenses WHERE license_key=%s", (lk,))
 
-        return _redir()
+        return _redir(True)
     except Exception as e:
         print("[/admin/action] error:", repr(e))
         return _redir()
